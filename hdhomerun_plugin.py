@@ -6,6 +6,7 @@ import requests
 import socket
 import time
 import threading
+import urllib3
 from typing import Any, List, Optional, Dict, Tuple
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,9 @@ from screamrouter.screamrouter_types.configuration import SourceDescription
 from screamrouter.screamrouter_logger.screamrouter_logger import get_logger
 from screamrouter.audio.scream_header_parser import create_stream_info
 from screamrouter.constants import constants
+
+# Suppress InsecureRequestWarning for self-signed certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = get_logger(__name__)
 
@@ -228,20 +232,19 @@ class PluginHDHomeRun(ScreamRouterPlugin):
     
     def __init__(self):
         super().__init__("HDHomeRun Radio")
-        self.tag = "HDHomeRun"  # Base tag for temporary source instance IDs
+        self.tag = "HDHomeRun"
         self.devices: Dict[str, str] = {}  # ip -> name mapping
         self.refresh_interval = 3600  # Refresh lineup every hour
         self.discovery_interval = 300  # Re-discover devices every 5 minutes
-        self.registered_sources: set = set()  # Track registered sources to avoid duplicates
+        self.registered_sources: set = set()
         self.last_discovery = 0
         self.channel_urls: Dict[str, str] = {}  # tag -> URL mapping
         self.channel_names: Dict[str, str] = {}  # tag -> friendly name mapping
 
-        # Streaming infrastructure (similar to play_url plugin)
-        self.ffmpeg_processes: Dict[str, subprocess.Popen] = {}  # source_id -> ffmpeg process
-        self.ffmpeg_pipes: Dict[str, Tuple[int, int]] = {}  # source_id -> (read_fd, write_fd)
-        self.active_streams: Dict[str, Dict[str, Any]] = {}  # source_id -> stream info
-        self.source_instance_ids: Dict[str, str] = {}  # tag -> instance_id mapping
+        # Streaming infrastructure
+        self.ffmpeg_processes: Dict[str, subprocess.Popen] = {}
+        self.ffmpeg_pipes: Dict[str, Tuple[int, int]] = {}
+        self.active_streams: Dict[str, Dict[str, Any]] = {}
 
         # Default audio format
         self.default_bit_depth = 16
@@ -252,19 +255,19 @@ class PluginHDHomeRun(ScreamRouterPlugin):
     def plugin_start(self, api: FastAPI, audio_manager_instance: Any = None):
         """Start plugin, register endpoints, and begin device discovery"""
         super().plugin_start(api, audio_manager_instance)
-        
+
         # Register API endpoints
         @api.get("/hdhomerun/devices")
         async def get_devices():
             """List discovered HDHomeRun devices"""
             return {"devices": self.devices}
-        
+
         @api.post("/hdhomerun/refresh")
         async def refresh_lineup():
             """Manually refresh station lineup"""
             self.fetch_all_stations()
             return {"status": "refreshed"}
-        
+
         @api.post("/hdhomerun/discover")
         async def trigger_discovery():
             """Manually trigger device discovery"""
@@ -274,19 +277,7 @@ class PluginHDHomeRun(ScreamRouterPlugin):
         @api.get("/hdhomerun/channels")
         async def get_channels():
             """List all discovered HDHomeRun channels with their URLs"""
-            if not hasattr(self, 'channel_urls'):
-                return {"channels": {}}
             return {"channels": self.channel_urls}
-
-        @api.get("/hdhomerun/play/{tag}")
-        async def get_play_url(tag: str):
-            """Get the stream URL for a specific channel tag"""
-            if not hasattr(self, 'channel_urls'):
-                return {"error": "No channels discovered yet"}
-            if tag not in self.channel_urls:
-                return {"error": f"Channel {tag} not found"}
-            return {"tag": tag, "url": self.channel_urls[tag]}
-
 
         @api.get("/hdhomerun/stream/active")
         async def get_active_streams():
@@ -296,32 +287,29 @@ class PluginHDHomeRun(ScreamRouterPlugin):
                 "count": len(self.active_streams)
             }
 
-        @api.post("/hdhomerun/play/{tag}/sink/{sink_name}")
-        async def play_channel_on_sink(tag: str, sink_name: str):
-            """Play a HDHomeRun channel on a specific sink"""
-            if tag not in self.channel_urls:
-                return {"error": f"Channel {tag} not found"}
+        @api.get("/hdhomerun/sources")
+        async def get_permanent_sources():
+            """Debug endpoint to see registered permanent sources"""
+            return {
+                "permanent_sources": [{"name": s.name, "tag": s.tag} for s in self.permanent_sources],
+                "registered_sources": list(self.registered_sources),
+                "wants_reload": self.wants_reload,
+                "count": len(self.permanent_sources)
+            }
 
-            # Start the stream
-            success = self.start_stream_for_sink(tag, sink_name)
-            if success:
-                return {"status": "started", "tag": tag, "sink": sink_name, "url": self.channel_urls[tag]}
-            else:
-                return {"error": f"Failed to start stream for {tag}"}
-
-        @api.post("/hdhomerun/stop/{tag}")
-        async def stop_channel(tag: str):
-            """Stop a HDHomeRun channel stream"""
-            if tag in self.active_streams:
-                self.stop_stream(tag)
-                return {"status": "stopped", "tag": tag}
-            else:
-                return {"error": f"Stream {tag} not active"}
-
-        # Perform initial discovery in background thread to not block startup
+        # Perform initial discovery in background thread
         logger.info("Scheduling initial HDHomeRun device discovery in background")
         discovery_thread = threading.Thread(target=self.discover_devices, daemon=True)
         discovery_thread.start()
+
+        # Log available methods on audio_manager_instance for debugging
+        if self.audio_manager_instance:
+            methods = [m for m in dir(self.audio_manager_instance) if not m.startswith('_')]
+            logger.info(f"AudioManager available methods: {methods}")
+
+        # Start the plugin's main thread (runs the run() method)
+        logger.info("Starting HDHomeRun plugin main thread")
+        self.start()
 
     def discover_devices(self):
         """Discover HDHomeRun devices using all available methods"""
@@ -329,12 +317,10 @@ class PluginHDHomeRun(ScreamRouterPlugin):
             logger.info("Running HDHomeRun device discovery (all methods)")
             discovered = discover_all_methods(mdns_timeout=10)
 
-            # Add newly discovered devices
             for ip, name in discovered.items():
                 if ip not in self.devices:
                     self.devices[ip] = name
                     logger.info(f"Added new HDHomeRun device: {name} ({ip})")
-                    # Fetch stations from this device
                     self.fetch_stations_from_device(ip, name)
 
             self.last_discovery = time.time()
@@ -348,7 +334,7 @@ class PluginHDHomeRun(ScreamRouterPlugin):
             response = requests.get(f"http://{device_ip}/lineup.json", timeout=5)
             response.raise_for_status()
             lineup = response.json()
-            
+
             if not lineup:
                 logger.warning(f"No channels found on {device_name}")
                 return
@@ -359,78 +345,67 @@ class PluginHDHomeRun(ScreamRouterPlugin):
                 guide_number = station.get('GuideNumber', '')
                 guide_name = station.get('GuideName', 'Unknown')
                 stream_url = station.get('URL', '')
-                
+
                 if not stream_url:
                     continue
 
-                # Filter for radio stations (optional - you can customize this)
-                # Comment out the next two lines to include ALL channels (TV + Radio)
+                # Filter for radio stations
                 if not is_likely_radio(guide_number, guide_name):
                     continue
 
-                # Create unique tag for this station
                 tag = f"hdhomerun_{device_ip.replace('.', '_')}_{guide_number.replace('.', '_')}"
-                
-                # Avoid duplicates
+
                 if tag in self.registered_sources:
                     continue
-                
-                # Log the URL being registered
+
                 logger.info(f"Registering channel {guide_number} ({guide_name}) with URL: {stream_url}")
 
-                # Store the channel info for when we need to stream it
-                # With temporary sources, we create them on-demand when user requests playback
+                # Store channel info
                 self.channel_urls[tag] = stream_url
                 self.channel_names[tag] = f"HDHomeRun [{device_name}]: {guide_name} ({guide_number})"
+
+                # Create permanent source using the proper method
+                source = SourceDescription(
+                    name=self.channel_names[tag],
+                    tag=tag,
+                    enabled=True
+                )
+                # Use the base class method to add permanent source
+                self.add_permanet_source(source)
                 self.registered_sources.add(tag)
-                logger.info(f"Registered channel: {self.channel_names[tag]} with tag: {tag}")
+                logger.info(f"Added permanent source: {self.channel_names[tag]}")
+
+            # Ensure wants_reload is set after adding all sources from this device
+            self.wants_reload = True
+            logger.info(f"Set wants_reload=True, permanent_sources count: {len(self.permanent_sources)}")
 
         except Exception as e:
             logger.error(f"Failed to fetch lineup from {device_ip}: {e}")
-    
+
     def fetch_all_stations(self):
         """Refresh stations from all known devices"""
         logger.info("Refreshing all HDHomeRun stations")
         for device_ip, device_name in self.devices.items():
             self.fetch_stations_from_device(device_ip, device_name)
-    
-    def start_stream_for_sink(self, source_tag: str, sink_name: str) -> bool:
-        """Start streaming a HDHomeRun channel to a specific sink using temporary source"""
+
+    def start_stream(self, source_tag: str) -> bool:
+        """Start ffmpeg for a HDHomeRun channel"""
         if source_tag not in self.channel_urls:
             logger.error(f"Cannot start stream: channel {source_tag} not found")
             return False
 
         if source_tag in self.active_streams:
-            logger.warning(f"Stream {source_tag} already active")
-            return True
+            return True  # Already running
 
         url = self.channel_urls[source_tag]
-        logger.info(f"Starting stream for {source_tag} to sink {sink_name}: {url}")
+        logger.info(f"Starting ffmpeg for {source_tag}: {url}")
 
         try:
-            # Create a temporary source for this stream
-            source_desc = SourceDescription(
-                name=self.channel_names.get(source_tag, f"HDHomeRun {source_tag}"),
-                tag=source_tag,
-                enabled=True
-            )
-
-            # Add temporary source and get instance_id
-            instance_id = self.add_temporary_source(sink_name, source_desc)
-            if not instance_id:
-                logger.error(f"Failed to add temporary source for {source_tag}")
-                return False
-
-            self.source_instance_ids[source_tag] = instance_id
-            logger.info(f"Created temporary source with instance_id: {instance_id}")
-
-            # Create pipe for ffmpeg output
             read_fd, write_fd = os.pipe()
 
-            # Build ffmpeg command
             ffmpeg_command = [
-                "ffmpeg", "-hide_banner",
-                "-re",  # Read input at native frame rate
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-re",
                 "-i", url,
                 "-f", f"s{self.default_bit_depth}le",
                 "-ac", f"{self.default_channels}",
@@ -438,25 +413,24 @@ class PluginHDHomeRun(ScreamRouterPlugin):
                 f"pipe:{write_fd}"
             ]
 
-            logger.debug(f"[HDHomeRun] ffmpeg command: {ffmpeg_command}")
+            logger.info(f"FFmpeg command: {' '.join(ffmpeg_command)}")
 
-            # Start ffmpeg process
-            output = None if constants.SHOW_FFMPEG_OUTPUT else subprocess.DEVNULL
             process = subprocess.Popen(
                 ffmpeg_command,
                 shell=False,
                 start_new_session=True,
                 pass_fds=[write_fd],
                 stdin=subprocess.PIPE,
-                stdout=output,
-                stderr=output
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
 
-            # Store process and pipe info
-            self.ffmpeg_processes[source_tag] = process
-            self.ffmpeg_pipes[source_tag] = (read_fd, write_fd)
+            # Close write end in parent process after fork
+            os.close(write_fd)
 
-            # Create stream info for this source
+            self.ffmpeg_processes[source_tag] = process
+            self.ffmpeg_pipes[source_tag] = read_fd
+
             stream_info = create_stream_info(
                 self.default_bit_depth,
                 self.default_sample_rate,
@@ -465,8 +439,6 @@ class PluginHDHomeRun(ScreamRouterPlugin):
             )
 
             self.active_streams[source_tag] = {
-                'instance_id': instance_id,
-                'sink_name': sink_name,
                 'bit_depth': self.default_bit_depth,
                 'sample_rate': self.default_sample_rate,
                 'channels': self.default_channels,
@@ -475,80 +447,110 @@ class PluginHDHomeRun(ScreamRouterPlugin):
                 'chunk_size': self.get_chunk_size_bytes(self.default_channels, self.default_bit_depth)
             }
 
-            logger.info(f"Stream started successfully for {source_tag}")
+            logger.info(f"FFmpeg started for {source_tag}, pid={process.pid}")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to start stream for {source_tag}: {e}")
+            logger.error(f"Failed to start ffmpeg for {source_tag}: {e}")
             self.stop_stream(source_tag)
             return False
 
     def stop_stream(self, source_tag: str):
-        """Stop streaming a HDHomeRun channel"""
+        """Stop ffmpeg for a channel"""
         logger.info(f"Stopping stream for {source_tag}")
 
-        # Remove temporary source
-        if source_tag in self.source_instance_ids:
-            instance_id = self.source_instance_ids[source_tag]
-            try:
-                self.remove_temporary_source(instance_id)
-                logger.info(f"Removed temporary source {instance_id}")
-            except Exception as e:
-                logger.warning(f"Error removing temporary source: {e}")
-            del self.source_instance_ids[source_tag]
-
-        # Kill ffmpeg process
         if source_tag in self.ffmpeg_processes:
             process = self.ffmpeg_processes[source_tag]
             if process.poll() is None:
-                process.kill()
-                process.wait()
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
             del self.ffmpeg_processes[source_tag]
 
-        # Close pipes
         if source_tag in self.ffmpeg_pipes:
-            read_fd, write_fd = self.ffmpeg_pipes[source_tag]
             try:
-                os.close(read_fd)
-            except OSError:
-                pass
-            try:
-                os.close(write_fd)
+                os.close(self.ffmpeg_pipes[source_tag])
             except OSError:
                 pass
             del self.ffmpeg_pipes[source_tag]
 
-        # Remove stream info
         if source_tag in self.active_streams:
             del self.active_streams[source_tag]
 
-        logger.info(f"Stream stopped for {source_tag}")
+    def get_audio_data(self, source_tag: str, num_bytes: int) -> Optional[bytes]:
+        """Called by ScreamRouter to get audio data for a permanent source.
+        This is the key method that makes permanent sources work."""
 
+        # Check if this is one of our sources
+        if source_tag not in self.channel_urls:
+            logger.warning(f"get_audio_data: Unknown source tag {source_tag}")
+            return None
+
+        # Start stream if not already running
+        if source_tag not in self.active_streams:
+            logger.info(f"get_audio_data: Starting stream for {source_tag}")
+            if not self.start_stream(source_tag):
+                return None
+
+        # Check if ffmpeg is still running
+        if source_tag in self.ffmpeg_processes:
+            process = self.ffmpeg_processes[source_tag]
+            if process.poll() is not None:
+                logger.warning(f"FFmpeg died for {source_tag}, restarting...")
+                self.stop_stream(source_tag)
+                if not self.start_stream(source_tag):
+                    return None
+
+        # Read from pipe
+        if source_tag in self.ffmpeg_pipes:
+            read_fd = self.ffmpeg_pipes[source_tag]
+            try:
+                ready = select.select([read_fd], [], [], 0.01)
+                if ready[0]:
+                    data = os.read(read_fd, num_bytes)
+                    if data:
+                        return data
+                    else:
+                        # EOF - ffmpeg ended
+                        logger.info(f"FFmpeg EOF for {source_tag}")
+                        self.stop_stream(source_tag)
+                        return None
+                else:
+                    # No data ready, return silence
+                    return bytes(num_bytes)
+            except Exception as e:
+                logger.error(f"Error reading from ffmpeg for {source_tag}: {e}")
+                self.stop_stream(source_tag)
+                return None
+
+        return None
 
     def load(self, controller_write_fds: List[int]):
         """Called when available source list changes"""
         super().load(controller_write_fds)
-        # Fetch stations from all discovered devices
         self.fetch_all_stations()
-    
+
     def unload(self):
         """Called when unloading the plugin"""
         logger.info("Unloading HDHomeRun plugin")
+        # Stop all streams
+        for source_tag in list(self.active_streams.keys()):
+            self.stop_stream(source_tag)
         self.registered_sources.clear()
         super().unload()
-    
+
     def stop(self):
         """Stop the plugin and clean up resources"""
         logger.info("Stopping HDHomeRun plugin")
-
-        # Stop all active streams
         for source_tag in list(self.active_streams.keys()):
             self.stop_stream(source_tag)
-
         super().stop()
-    
+
     def run(self):
-        """Main thread loop - handle streaming, discovery, and refresh"""
+        """Main thread loop - periodic discovery, cleanup, and route monitoring"""
         logger.info(f"[{self.name}] Plugin thread started")
 
         last_refresh = 0
@@ -566,59 +568,77 @@ class PluginHDHomeRun(ScreamRouterPlugin):
                 self.fetch_all_stations()
                 last_refresh = current_time
 
-            # Handle active streams - read from ffmpeg and write to ScreamRouter
+            # Check for active routes to our sources and start/stop ffmpeg accordingly
+            self.check_active_routes()
+
+            # Check for dead ffmpeg processes
             for source_tag in list(self.active_streams.keys()):
-                if source_tag not in self.ffmpeg_pipes:
-                    continue
+                if source_tag in self.ffmpeg_processes:
+                    process = self.ffmpeg_processes[source_tag]
+                    if process.poll() is not None:
+                        logger.warning(f"FFmpeg for {source_tag} died, cleaning up")
+                        self.stop_stream(source_tag)
 
-                read_fd, _ = self.ffmpeg_pipes[source_tag]
-                process = self.ffmpeg_processes.get(source_tag)
-                stream_info = self.active_streams[source_tag]
-                instance_id = stream_info.get('instance_id')
+            time.sleep(1)  # Check every second for responsiveness
 
-                # Check if ffmpeg process has ended
-                if process and process.poll() is not None:
-                    logger.warning(f"FFmpeg process for {source_tag} ended unexpectedly")
-                    self.stop_stream(source_tag)
-                    continue
-
-                # Check for data from ffmpeg (non-blocking)
-                try:
-                    ready = select.select([read_fd], [], [], 0.01)  # 10ms timeout
-                    if ready[0]:
-                        chunk_size = stream_info['chunk_size']
-                        pcm_data = os.read(read_fd, chunk_size)
-
-                        if not pcm_data:  # EOF
-                            logger.info(f"FFmpeg for {source_tag} sent EOF")
-                            self.stop_stream(source_tag)
-                            continue
-
-                        if len(pcm_data) == chunk_size:
-                            # Write audio data to ScreamRouter using the instance_id
-                            self.write_data(
-                                source_instance_id=instance_id,
-                                pcm_data=pcm_data,
-                                channels=stream_info['channels'],
-                                sample_rate=stream_info['sample_rate'],
-                                bit_depth=stream_info['bit_depth'],
-                                chlayout1=stream_info['chlayout1'],
-                                chlayout2=stream_info['chlayout2']
-                            )
-                        elif len(pcm_data) > 0:
-                            logger.warning(f"Partial packet from ffmpeg for {source_tag}: {len(pcm_data)} bytes")
-
-                except Exception as e:
-                    logger.error(f"Error reading from ffmpeg for {source_tag}: {e}")
-                    self.stop_stream(source_tag)
-
-            # Small sleep to prevent CPU spinning when no active streams
-            if not self.active_streams:
-                time.sleep(1)
-
-        # Cleanup on exit
-        logger.info(f"[{self.name}] Plugin thread stopping, cleaning up streams")
+        # Cleanup
+        logger.info(f"[{self.name}] Plugin thread stopping")
         for source_tag in list(self.active_streams.keys()):
             self.stop_stream(source_tag)
 
         logger.info(f"[{self.name}] Plugin thread stopped")
+
+    def check_active_routes(self):
+        """Check if any of our sources have active routes and start/stop ffmpeg accordingly.
+        We query ScreamRouter's own API to find active routes."""
+        try:
+            # Query ScreamRouter's routes API (HTTPS with self-signed cert)
+            response = requests.get("https://127.0.0.1:8443/routes", timeout=2, verify=False)
+            if response.status_code != 200:
+                logger.warning(f"Failed to query ScreamRouter routes API: {response.status_code}")
+                return
+
+            routes = response.json()
+            logger.debug(f"Got {len(routes)} routes from ScreamRouter API")
+
+            # Build a reverse lookup: source name -> tag
+            name_to_tag = {name: tag for tag, name in self.channel_names.items()}
+            logger.debug(f"Have {len(name_to_tag)} HDHomeRun channels registered")
+
+            # Find which of our sources are currently routed
+            active_tags = set()
+            for route in routes:
+                if not route.get('enabled', True):
+                    continue
+                source_name = route.get('source', '')
+
+                # Check if this source name matches any of our channel names
+                if source_name in name_to_tag:
+                    active_tags.add(name_to_tag[source_name])
+                    logger.debug(f"Found active route for source: {source_name}")
+                else:
+                    # Also check if the source matches any tag directly
+                    if source_name in self.channel_urls:
+                        active_tags.add(source_name)
+                        logger.debug(f"Found active route for tag: {source_name}")
+
+            if active_tags:
+                logger.info(f"Active HDHomeRun sources: {active_tags}")
+
+            # Start streams for our sources that are now active
+            for tag in active_tags:
+                if tag not in self.active_streams:
+                    logger.info(f"Source {tag} has active route, starting stream")
+                    self.start_stream(tag)
+
+            # Stop streams for sources that are no longer active
+            for tag in list(self.active_streams.keys()):
+                if tag not in active_tags:
+                    logger.info(f"Source {tag} no longer has active route, stopping stream")
+                    self.stop_stream(tag)
+
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Could not check routes (request error): {e}")
+        except Exception as e:
+            logger.warning(f"Error checking active routes: {e}")
+
