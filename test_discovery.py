@@ -292,7 +292,7 @@ def scan_subnet_for_hdhomerun() -> Dict[str, str]:
         # Check common IPs that HDHomeRun might use (faster than full scan)
         common_ips = list(range(2, 255))
         
-        for i in common_ips[:20]:  # Test first 20 IPs for speed
+        for i in common_ips:  # Test first 20 IPs for speed
             test_ip = f"{subnet_base}.{i}"
             if verify_hdhomerun(test_ip):
                 device_name = get_device_name(test_ip)
