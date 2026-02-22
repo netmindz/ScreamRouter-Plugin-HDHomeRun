@@ -19,20 +19,47 @@ class TestHDHomeRunDiscovery(ServiceListener):
         if info:
             if info.addresses:
                 ip = '.'.join(str(b) for b in info.addresses[0])
-                self.devices[ip] = name
-                print(f"✓ Discovered HDHomeRun device via mDNS: {name}")
-                print(f"  IP Address: {ip}")
-                print(f"  Port: {info.port}")
-                print()
+                # Verify this is actually a HDHomeRun device
+                if verify_hdhomerun(ip):
+                    device_name = get_device_name(ip)
+                    self.devices[ip] = device_name
+                    print(f"✓ Discovered HDHomeRun device: {device_name}")
+                    print(f"  IP Address: {ip}")
+                    print(f"  Port: {info.port}")
+                    print()
     
     def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         """Called when a HDHomeRun device disappears"""
-        print(f"✗ Device removed: {name}")
+        pass
     
     def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         """Called when a HDHomeRun device is updated"""
         pass
 
+
+def verify_hdhomerun(ip: str) -> bool:
+    """Verify if an IP address is actually a HDHomeRun device"""
+    try:
+        response = requests.get(f"http://{ip}/discover.json", timeout=2)
+        response.raise_for_status()
+        info = response.json()
+        
+        # Check for HDHomeRun-specific fields
+        if 'DeviceID' in info and 'ModelNumber' in info:
+            return True
+    except:
+        pass
+    return False
+
+def get_device_name(ip: str) -> str:
+    """Get the friendly name of a HDHomeRun device"""
+    try:
+        response = requests.get(f"http://{ip}/discover.json", timeout=2)
+        response.raise_for_status()
+        info = response.json()
+        return info.get('FriendlyName', f"HDHomeRun at {ip}")
+    except:
+        return f"HDHomeRun at {ip}"
 
 def discover_via_mdns(timeout: int = 10) -> Dict[str, str]:
     """Discover HDHomeRun devices via mDNS/Zeroconf"""
@@ -45,11 +72,9 @@ def discover_via_mdns(timeout: int = 10) -> Dict[str, str]:
         zeroconf = Zeroconf()
         listener = TestHDHomeRunDiscovery()
         
-        # Try multiple service types that HDHomeRun might use
+        # HDHomeRun-specific service type
         service_types = [
             "_hdhomerun._tcp.local.",
-            "_dvb._tcp.local.",
-            "_http._tcp.local.",
         ]
         
         browsers = []
@@ -73,9 +98,9 @@ def discover_via_mdns(timeout: int = 10) -> Dict[str, str]:
         print(f"✗ mDNS discovery error: {e}\n")
     
     if devices:
-        print(f"✓ mDNS found {len(devices)} device(s)\n")
+        print(f"✓ mDNS found {len(devices)} HDHomeRun device(s)\n")
     else:
-        print("✗ No devices found via mDNS\n")
+        print("✗ No HDHomeRun devices found via mDNS\n")
     
     return devices
 
@@ -88,13 +113,11 @@ def discover_via_broadcast() -> Dict[str, str]:
     
     try:
         # HDHomeRun discovery protocol
-        # Send a discovery packet on port 65001
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(3)
         
         # HDHomeRun discovery packet format
-        # Simple discover request
         discover_packet = bytes([
             0x00, 0x02,  # Packet type: discover request
             0x00, 0x0c,  # Payload length
@@ -112,11 +135,13 @@ def discover_via_broadcast() -> Dict[str, str]:
                 data, addr = sock.recvfrom(1024)
                 ip = addr[0]
                 
-                if ip not in devices:
-                    devices[ip] = f"HDHomeRun at {ip}"
-                    print(f"✓ Discovered HDHomeRun device via broadcast")
-                    print(f"  IP Address: {ip}")
-                    print() 
+                if verify_hdhomerun(ip):
+                    if ip not in devices:
+                        device_name = get_device_name(ip)
+                        devices[ip] = device_name
+                        print(f"✓ Discovered HDHomeRun device via broadcast: {device_name}")
+                        print(f"  IP Address: {ip}")
+                        print() 
             except socket.timeout:
                 break
         
@@ -126,9 +151,9 @@ def discover_via_broadcast() -> Dict[str, str]:
         print(f"✗ UDP broadcast error: {e}\n")
     
     if devices:
-        print(f"✓ Broadcast found {len(devices)} device(s)\n")
+        print(f"✓ Broadcast found {len(devices)} HDHomeRun device(s)\n")
     else:
-        print("✗ No devices found via broadcast\n")
+        print("✗ No HDHomeRun devices found via broadcast\n")
     
     return devices
 
@@ -137,19 +162,23 @@ def test_manual_ip(ip: str) -> Optional[str]:
     print(f"🔍 Method 3: Testing manual IP: {ip}\n")
     
     try:
-        # Try to fetch device info
         response = requests.get(f"http://{ip}/discover.json", timeout=2)
         response.raise_for_status()
         info = response.json()
         
+        # Check if it's actually a HDHomeRun
+        if 'DeviceID' not in info or 'ModelNumber' not in info:
+            print(f"✗ Device at {ip} is not a HDHomeRun\n")
+            return None
+        
         device_name = info.get('FriendlyName', f"HDHomeRun at {ip}")
         print(f"✓ Found HDHomeRun device: {device_name}")
-        print(f"  Model: {info.get('ModelNumber', 'Unknown')}")
-        print(f"  Device ID: {info.get('DeviceID', 'Unknown')}")
-        print()
+        print(f"  Model: {info.get('ModelNumber', 'Unknown')}\n")
+        print(f"  Device ID: {info.get('DeviceID', 'Unknown')}\n")
+        print(f"  Firmware: {info.get('FirmwareVersion', 'Unknown')}\n")
         return device_name
-    except requests.RequestException:
-        print(f"✗ No HDHomeRun device found at {ip}\n")
+    except requests.RequestException as e:
+        print(f"✗ No HDHomeRun device found at {ip}: {e}\n")
         return None
 
 def fetch_lineup(device_ip: str, device_name: str) -> List[dict]:
@@ -199,23 +228,24 @@ def display_channels(lineup: List[dict], device_name: str, device_ip: str):
     print(f"Total channels: {len(lineup)} ({radio_count} radio, {tv_count} TV)")
     
     # Show what would be added as ScreamRouter sources
-    print(f"\n{'='*80}")
-    print(f"ScreamRouter Sources that would be created:")
-    print(f"{'='*80}")
-    
-    for channel in lineup:
-        guide_number = channel.get('GuideNumber', '')
-        guide_name = channel.get('GuideName', 'Unknown')
-        stream_url = channel.get('URL', '')
+    if radio_count > 0:
+        print(f"\n{'='*80}")
+        print(f"ScreamRouter Sources that would be created (Radio only):")
+        print(f"{'='*80}")
         
-        # Only show radio stations (or all if you want)
-        if is_likely_radio(guide_number, guide_name):
-            source_name = f"HDHomeRun [{device_name}]: {guide_name} ({guide_number})"
-            source_tag = f"hdhomerun_{device_ip.replace('.', '_')}_{guide_number.replace('.', '_')}"
+        for channel in lineup:
+            guide_number = channel.get('GuideNumber', '')
+            guide_name = channel.get('GuideName', 'Unknown')
+            stream_url = channel.get('URL', '')
             
-            print(f"\nSource Name: {source_name}")
-            print(f"  Tag: {source_tag}")
-            print(f"  URL: {stream_url}")
+            # Only show radio stations
+            if is_likely_radio(guide_number, guide_name):
+                source_name = f"HDHomeRun [{device_name}]: {guide_name} ({guide_number})"
+                source_tag = f"hdhomerun_{device_ip.replace('.', '_')}_{guide_number.replace('.', '_')}"
+                
+                print(f"\nSource Name: {source_name}")
+                print(f"  Tag: {source_tag}")
+                print(f"  URL: {stream_url}")
 
 def is_likely_radio(guide_number: str, guide_name: str) -> bool:
     """Heuristic to detect if a channel is likely a radio station"""
@@ -228,9 +258,49 @@ def is_likely_radio(guide_number: str, guide_name: str) -> bool:
     except (ValueError, IndexError):
         pass
     
-    radio_keywords = ['radio', 'fm', 'am', 'music', 'npr', 'jazz', 'classical', 'rock', 'news radio']
+    radio_keywords = ['radio', 'fm', 'am', 'music', 'npr', 'jazz', 'classical', 'rock', 'news radio', 'talk radio']
     name_lower = guide_name.lower()
     return any(keyword in name_lower for keyword in radio_keywords)
+
+def scan_subnet_for_hdhomerun() -> Dict[str, str]:
+    """Scan local subnet for HDHomeRun devices"""
+    print("🔍 Method 4: Subnet Scan (checking common IPs)")
+    print("   (This may take a minute...\n")
+    
+    devices = {}
+    
+    try:
+        # Get local IP to determine subnet
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        
+        # Get subnet (assuming /24)
+        subnet_parts = local_ip.split('.\n')
+        subnet_base = '.'.join(subnet_parts[:3])
+        
+        print(f"  Scanning subnet {subnet_base}.0/24 for HDHomeRun devices...")
+        
+        # Check common IPs that HDHomeRun might use (faster than full scan)
+        common_ips = list(range(2, 255))
+        
+        for i in common_ips[:20]:  # Test first 20 IPs for speed
+            test_ip = f"{subnet_base}.{i}"
+            if verify_hdhomerun(test_ip):
+                device_name = get_device_name(test_ip)
+                devices[test_ip] = device_name
+                print(f"✓ Found HDHomeRun: {device_name} at {test_ip}")
+        
+        if devices:
+            print(f"\n✓ Subnet scan found {len(devices)} HDHomeRun device(s)\n")
+        else:
+            print(f"\n✗ No HDHomeRun devices found in subnet scan\n")
+            
+    except Exception as e:
+        print(f"✗ Subnet scan error: {e}\n")
+    
+    return devices
 
 def main():
     """Main test function"""
@@ -241,7 +311,7 @@ def main():
     
     all_devices = {}
     
-    # Method 1: mDNS Discovery
+    # Method 1: mDNS Discovery (HDHomeRun-specific)
     mdns_devices = discover_via_mdns(timeout=10)
     all_devices.update(mdns_devices)
     
@@ -249,31 +319,26 @@ def main():
     broadcast_devices = discover_via_broadcast()
     all_devices.update(broadcast_devices)
     
-    # Method 3: Manual IP (if user wants to test)
-    print("💡 You can also test a manual IP address")
-    print("   Usage: Uncomment the line in main() or run:")
-    print("   python test_discovery.py --ip 192.168.1.XXX\n")
-    
-    # Uncomment and modify this line to test a specific IP:
-    # manual_name = test_manual_ip("192.168.1.100")
-    # if manual_name:
-    #     all_devices["192.168.1.100"] = manual_name
+    # Method 3: Subnet scan (if nothing found yet)
+    if not all_devices:
+        print("⚠️  No devices found yet, trying subnet scan...\n")
+        subnet_devices = scan_subnet_for_hdhomerun()
+        all_devices.update(subnet_devices)
     
     # Summary
     print(f"{'='*80}")
-    print(f"Discovery Complete - Found {len(all_devices)} device(s) total")
+    print(f"Discovery Complete - Found {len(all_devices)} HDHomeRun device(s) total")
     print(f"{'='*80}\n")
     
     if not all_devices:
         print("⚠️  No HDHomeRun devices found on the network.")
         print("\n🔧 Troubleshooting tips:")
         print("  1. Ensure HDHomeRun device is powered on and connected to network")
-        print("  2. Check that mDNS/Bonjour is working on your network")
-        print("  3. Verify device is on the same subnet/VLAN")
-        print("  4. Try manually accessing http://<device-ip>/discover.json in browser")
-        print("  5. Check firewall settings (need UDP 65001 and TCP 80)")
-        print("  6. Try the HDHomeRun app to verify device is working")
-        print("\n💡 If you know your device's IP, uncomment the manual test in main()")
+        print("  2. Verify device is on the same subnet/VLAN as this computer")
+        print("  3. Try the HDHomeRun app to verify device is working")
+        print("  4. Check firewall settings (need UDP 65001 and TCP 80)")
+        print("  5. Try accessing http://<device-ip>/discover.json in browser")
+        print("\n💡 Manual test: python test_discovery.py --ip <your-hdhomerun-ip>")
     else:
         # Fetch and display lineup for each device
         for device_ip, device_name in all_devices.items():
